@@ -234,3 +234,20 @@ class GSMClient:
             print(f"[+] TMSI обновлен: {old_tmsi} -> {new_tmsi}")
 
         print("[+] Клиент готов к обмену данными")
+
+
+
+
+if __name__ == "__main__":
+    config = ClientConfig(
+        server_host="192.168.56.101",
+        server_port=9000,
+        sim_config_path="sim_card.json"
+    )
+
+    client = GSMClient(config)
+
+    try:
+        client.run()
+    except Exception as e:
+        print(f"[!] Ошибка: {e}")
