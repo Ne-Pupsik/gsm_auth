@@ -5,10 +5,13 @@ import hmac
 import secrets
 import threading
 import uuid
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from A5 import encrypt_text
 
 # =========================
 # Настройки сервера
@@ -17,14 +20,10 @@ from typing import Optional
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
-    port: int = 9000
+    port: int = 5050
     subscribers_db_path: str = "subscribers.json"
     backlog: int = 5
 
-
-# =========================
-# Сетевые функции
-# =========================
 
 def recv_line(sock: socket.socket) -> str:
     data = bytearray()
@@ -49,21 +48,7 @@ def recv_json(sock: socket.socket) -> dict:
     return json.loads(recv_line(sock))
 
 
-# =========================
-# Учебная реализация A3/A8
-# =========================
-
 def a3_a8_demo(ki_hex: str, rand_hex: str) -> tuple[str, str]:
-    """
-    Учебная имитация A3/A8.
-    Вход:
-      ki_hex   - 128 бит (16 байт)
-      rand_hex - 128 бит (16 байт)
-
-    Выход:
-      sres_hex - 32 бита (4 байта)
-      kc_hex   - 64 бита (8 байт)
-    """
     ki = bytes.fromhex(ki_hex)
     rand = bytes.fromhex(rand_hex)
 
@@ -79,10 +64,6 @@ def a3_a8_demo(ki_hex: str, rand_hex: str) -> tuple[str, str]:
     return sres.hex(), kc.hex()
 
 
-# =========================
-# База абонентов
-# =========================
-
 class SubscriberDB:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -91,12 +72,13 @@ class SubscriberDB:
 
     def _load(self) -> list[dict]:
         if not self.path.exists():
-            raise FileNotFoundError(
-                f"Файл базы абонентов не найден: {self.path}"
-            )
+            raise FileNotFoundError(f"Файл базы абонентов не найден: {self.path}")
 
-        with self.path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        raw_text = self.path.read_text(encoding="utf-8").strip()
+        if not raw_text:
+            raise ValueError(f"Файл базы абонентов пуст: {self.path}")
+
+        data = json.loads(raw_text)
 
         if not isinstance(data, list):
             raise ValueError("Файл subscribers.json должен содержать список абонентов")
@@ -148,7 +130,6 @@ class SubscriberDB:
 
     def generate_unique_tmsi(self) -> str:
         while True:
-            # 32 бита = 8 hex-символов
             tmsi = secrets.token_hex(4).upper()
             if self.find_by_tmsi(tmsi) is None:
                 return tmsi
@@ -161,16 +142,11 @@ class SubscriberDB:
             return new_tmsi
 
 
-# =========================
-# GSM сервер
-# =========================
-
 class GSMAuthServer:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.db = SubscriberDB(config.subscribers_db_path)
 
-        # session_id -> session_data
         self.sessions: dict[str, dict] = {}
         self.sessions_lock = threading.Lock()
 
@@ -195,14 +171,14 @@ class GSMAuthServer:
                 thread.start()
 
     def handle_client(self, sock: socket.socket, addr) -> None:
+        client_tag = f"{addr[0]}:{addr[1]}"
+
         try:
             with sock:
                 request = recv_json(sock)
-                print(f"[{addr[0]}:{addr[1]}] [<] {request}")
+                print(f"[{client_tag}] [<] {request}")
 
-                req_type = request.get("type")
-
-                if req_type != "auth_start":
+                if request.get("type") != "auth_start":
                     send_json(sock, {
                         "type": "auth_result",
                         "status": "error",
@@ -210,19 +186,28 @@ class GSMAuthServer:
                     })
                     return
 
-                session = self.process_auth_start(request)
+                try:
+                    session = self.process_auth_start(request)
+                except Exception as e:
+                    send_json(sock, {
+                        "type": "auth_result",
+                        "status": "error",
+                        "message": str(e)
+                    })
+                    return
+
                 send_json(sock, {
                     "type": "auth_challenge",
                     "session_id": session["session_id"],
                     "rand": session["rand_hex"]
                 })
                 print(
-                    f"[{addr[0]}:{addr[1]}] [>] auth_challenge "
+                    f"[{client_tag}] [>] auth_challenge "
                     f"session_id={session['session_id']} rand={session['rand_hex']}"
                 )
 
                 response = recv_json(sock)
-                print(f"[{addr[0]}:{addr[1]}] [<] {response}")
+                print(f"[{client_tag}] [<] {response}")
 
                 if response.get("type") != "auth_response":
                     send_json(sock, {
@@ -232,13 +217,20 @@ class GSMAuthServer:
                     })
                     return
 
-                result = self.process_auth_response(response)
+                result, auth_context = self.process_auth_response(response)
 
                 send_json(sock, result)
-                print(f"[{addr[0]}:{addr[1]}] [>] {result}")
+                print(f"[{client_tag}] [>] {result}")
 
+                if result.get("status") != "ok":
+                    return
+
+                self.data_exchange_loop(sock, client_tag, auth_context)
+
+        except ConnectionError:
+            print(f"[{client_tag}] Соединение закрыто")
         except Exception as e:
-            print(f"[!] Ошибка при работе с клиентом {addr}: {e}")
+            print(f"[!] Ошибка при работе с клиентом {client_tag}: {e}")
 
     def process_auth_start(self, request: dict) -> dict:
         id_type = request.get("id_type")
@@ -287,7 +279,7 @@ class GSMAuthServer:
 
         return session_data
 
-    def process_auth_response(self, request: dict) -> dict:
+    def process_auth_response(self, request: dict) -> tuple[dict, Optional[dict]]:
         session_id = request.get("session_id")
         sres_received = request.get("sres")
 
@@ -296,14 +288,14 @@ class GSMAuthServer:
                 "type": "auth_result",
                 "status": "error",
                 "message": "Отсутствует session_id"
-            }
+            }, None
 
         if not sres_received:
             return {
                 "type": "auth_result",
                 "status": "error",
                 "message": "Отсутствует SRES"
-            }
+            }, None
 
         with self.sessions_lock:
             session = self.sessions.pop(session_id, None)
@@ -313,7 +305,7 @@ class GSMAuthServer:
                 "type": "auth_result",
                 "status": "error",
                 "message": "Сессия не найдена или уже завершена"
-            }
+            }, None
 
         sres_expected = session["sres_expected"]
         imsi = session["subscriber_imsi"]
@@ -323,7 +315,7 @@ class GSMAuthServer:
                 "type": "auth_result",
                 "status": "fail",
                 "message": "Неверный SRES. Аутентификация не пройдена."
-            }
+            }, None
 
         subscriber = self.db.find_by_imsi(imsi)
         if subscriber is None:
@@ -331,27 +323,83 @@ class GSMAuthServer:
                 "type": "auth_result",
                 "status": "error",
                 "message": "Абонент не найден в базе на этапе завершения аутентификации"
-            }
+            }, None
 
         new_tmsi = self.db.assign_new_tmsi(subscriber)
+
+        auth_context = {
+            "imsi": imsi,
+            "kc_hex": session["kc_hex"]
+        }
 
         return {
             "type": "auth_result",
             "status": "ok",
             "message": "Authentication successful",
             "new_tmsi": new_tmsi
-        }
+        }, auth_context
 
+    def data_exchange_loop(self, sock: socket.socket, client_tag: str, auth_context: dict) -> None:
+        imsi = auth_context["imsi"]
+        kc_hex = auth_context["kc_hex"]
 
-# =========================
-# Точка входа
-# =========================
+        print(f"[{client_tag}] Переход в режим приема данных для IMSI={imsi}")
+
+        while True:
+            request = recv_json(sock)
+            print(f"[{client_tag}] [<] {request}")
+
+            msg_type = request.get("type")
+
+            if msg_type == "data":
+                nonce_hex = request.get("nonce")
+                ciphertext_hex = request.get("ciphertext")
+
+                if not nonce_hex or not ciphertext_hex:
+                    send_json(sock, {
+                        "type": "error",
+                        "message": "Для data нужны поля nonce и ciphertext"
+                    })
+                    continue
+
+                try:
+                    plaintext = decrypt_text(kc_hex, nonce_hex, ciphertext_hex)
+                except Exception as e:
+                    send_json(sock, {
+                        "type": "error",
+                        "message": f"Не удалось расшифровать сообщение: {e}"
+                    })
+                    continue
+
+                print(f"[DATA] IMSI={imsi} -> {plaintext}")
+
+                send_json(sock, {
+                    "type": "data_ack",
+                    "status": "ok"
+                })
+
+            elif msg_type == "close":
+                send_json(sock, {
+                    "type": "close_ack",
+                    "message": "Соединение закрывается"
+                })
+                print(f"[{client_tag}] Клиент завершил сеанс")
+                break
+
+            else:
+                send_json(sock, {
+                    "type": "error",
+                    "message": f"Неизвестный тип сообщения: {msg_type}"
+                })
+
 
 if __name__ == "__main__":
+    base_dir = Path(__file__).resolve().parent
+
     config = ServerConfig(
         host="0.0.0.0",
-        port=9000,
-        subscribers_db_path="subscribers.json"
+        port=5050,
+        subscribers_db_path=str(base_dir / "subscribers.json")
     )
 
     server = GSMAuthServer(config)

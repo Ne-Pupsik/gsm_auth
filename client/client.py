@@ -2,10 +2,15 @@ import socket
 import json
 import hashlib
 import hmac
+import sys
+import threading
 from client_config import ClientConfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from A5 import encrypt_text
 
 
 class SIMCard:
@@ -13,7 +18,6 @@ class SIMCard:
         self.imsi = imsi
         self.ki_hex = ki_hex.lower()
         self.tmsi = tmsi
-
         self._validate()
 
     def _validate(self) -> None:
@@ -63,12 +67,6 @@ class SIMCard:
         return self.tmsi is not None and self.tmsi != ""
 
     def run_gsm_algorithm(self, rand_hex: str) -> tuple[str, str]:
-        """
-        Учебная имитация A3/A8.
-        Возвращает:
-          SRES - 4 байта (32 бита)
-          Kc   - 8 байт (64 бита)
-        """
         ki = bytes.fromhex(self.ki_hex)
         rand = bytes.fromhex(rand_hex)
 
@@ -76,16 +74,11 @@ class SIMCard:
             raise ValueError("RAND должен быть длиной 16 байт (128 бит)")
 
         mac = hmac.new(ki, rand, hashlib.sha256).digest()
-
         sres = mac[:4]
         kc = mac[4:12]
 
         return sres.hex(), kc.hex()
 
-
-# =========================
-# Сетевые функции
-# =========================
 
 def recv_line(sock: socket.socket) -> str:
     data = bytearray()
@@ -110,10 +103,6 @@ def recv_json(sock: socket.socket) -> dict:
     return json.loads(recv_line(sock))
 
 
-# =========================
-# Клиент GSM
-# =========================
-
 class GSMClient:
     def __init__(self, config: ClientConfig):
         self.config = config
@@ -124,28 +113,29 @@ class GSMClient:
         self.kc_hex: Optional[str] = None
 
     def run(self) -> None:
+        print(self.config.sim_config_path)
         print(f"[+] Загружена SIM-карта из файла: {self.config.sim_config_path}")
         print(f"[+] IMSI: {self.sim.imsi}")
         print(f"[+] TMSI: {self.sim.tmsi if self.sim.tmsi else 'отсутствует'}")
-
         print(f"[+] Подключение к {self.config.server_host}:{self.config.server_port}")
 
         with socket.create_connection(
             (self.config.server_host, self.config.server_port),
             timeout=self.config.timeout_sec
         ) as sock:
-            sock.settimeout(self.config.timeout_sec)
+            sock.settimeout(None)
 
             self.start_auth(sock)
             self.process_challenge(sock)
             self.send_auth_response(sock)
-            self.process_auth_result(sock)
+
+            auth_ok = self.process_auth_result(sock)
+            if not auth_ok:
+                return
+
+            self.message_loop(sock)
 
     def start_auth(self, sock: socket.socket) -> None:
-        """
-        Если у SIM есть TMSI, используем его.
-        Иначе отправляем IMSI.
-        """
         if self.sim.has_tmsi():
             request = {
                 "type": "auth_start",
@@ -204,7 +194,7 @@ class GSMClient:
         print(f"[+] Вычислен Kc   = {kc_hex}")
         print("[>] Отправлен auth_response")
 
-    def process_auth_result(self, sock: socket.socket) -> None:
+    def process_auth_result(self, sock: socket.socket) -> bool:
         response = recv_json(sock)
         print(f"[<] Получено: {response}")
 
@@ -218,7 +208,7 @@ class GSMClient:
             print("[-] Аутентификация не пройдена")
             if message:
                 print(f"[-] Причина: {message}")
-            return
+            return False
 
         print("[+] Аутентификация прошла успешно")
         if message:
@@ -234,14 +224,86 @@ class GSMClient:
             print(f"[+] TMSI обновлен: {old_tmsi} -> {new_tmsi}")
 
         print("[+] Клиент готов к обмену данными")
+        return True
 
+    def receiver_loop(self, sock: socket.socket, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                response = recv_json(sock)
+            except Exception:
+                if not stop_event.is_set():
+                    print("\n[!] Соединение с сервером потеряно")
+                    stop_event.set()
+                break
 
+            msg_type = response.get("type")
+
+            if msg_type == "data_ack":
+                print("[<] Сервер принял сообщение")
+            elif msg_type == "error":
+                print(f"[<] Ошибка сервера: {response.get('message', 'unknown error')}")
+            elif msg_type == "close_ack":
+                print("[<] Сервер закрыл соединение")
+                stop_event.set()
+                break
+            else:
+                print(f"[<] Служебное сообщение: {response}")
+
+    def message_loop(self, sock: socket.socket) -> None:
+        if self.kc_hex is None:
+            raise RuntimeError("Нет Kc для шифрования")
+
+        print("Введите сообщения. Для выхода введите /exit")
+
+        stop_event = threading.Event()
+        receiver_thread = threading.Thread(
+            target=self.receiver_loop,
+            args=(sock, stop_event),
+            daemon=True
+        )
+        receiver_thread.start()
+
+        while not stop_event.is_set():
+            try:
+                text = input(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                text = "/exit"
+
+            if not text.strip():
+                continue
+
+            if text.strip() == "/exit":
+                try:
+                    send_json(sock, {"type": "close"})
+                except Exception:
+                    pass
+                break
+
+            nonce_hex, ciphertext_hex = encrypt_text(self.kc_hex, text)
+
+            request = {
+                "type": "data",
+                "nonce": nonce_hex,
+                "ciphertext": ciphertext_hex
+            }
+
+            try:
+                send_json(sock, request)
+            except Exception as e:
+                print(f"[!] Не удалось отправить сообщение: {e}")
+                break
+
+        stop_event.set()
+        receiver_thread.join(timeout=1.0)
+        print("[+] Клиент завершен")
 
 
 if __name__ == "__main__":
-    import os
-    print(os.path.abspath("sim.json"))
-    config = ClientConfig
+    config = ClientConfig(
+        server_host="192.168.0.103",
+        server_port=5050,
+        sim_config_path="sim.json"
+    )
 
     client = GSMClient(config)
 
