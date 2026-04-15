@@ -2,7 +2,7 @@ import socket
 import json
 import hashlib
 import hmac
-import client_config
+from client_config import ClientConfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -115,7 +115,7 @@ def recv_json(sock: socket.socket) -> dict:
 # =========================
 
 class GSMClient:
-    def __init__(self, config: client_config):
+    def __init__(self, config: ClientConfig):
         self.config = config
         self.sim = SIMCard.load_from_file(config.sim_config_path)
 
@@ -239,11 +239,9 @@ class GSMClient:
 
 
 if __name__ == "__main__":
-    config = ClientConfig(
-        server_host="192.168.56.101",
-        server_port=9000,
-        sim_config_path="sim_card.json"
-    )
+    import os
+    print(os.path.abspath("sim.json"))
+    config = ClientConfig
 
     client = GSMClient(config)
 
